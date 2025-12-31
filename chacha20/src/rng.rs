@@ -10,29 +10,25 @@ use core::fmt::Debug;
 
 use rand_core::{
     CryptoRng, RngCore, SeedableRng,
-    block::{BlockRng, BlockRngCore, CryptoBlockRng},
+    block::{BlockRng, CryptoGenerator, Generator},
 };
-
-#[cfg(feature = "serde1")]
-use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
 #[cfg(feature = "zeroize")]
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::{
     ChaChaCore, R8, R12, R20, Rounds, backends,
-    variants::{Ietf, Variant},
+    variants::{Legacy, Variant},
 };
 
 use cfg_if::cfg_if;
 
 /// Number of 32-bit words per ChaCha block (fixed by algorithm definition).
-const BLOCK_WORDS: u8 = 16;
+pub(crate) const BLOCK_WORDS: u8 = 16;
 
 /// The seed for ChaCha20. Implements ZeroizeOnDrop when the
 /// zeroize feature is enabled.
 #[derive(PartialEq, Eq, Default, Clone)]
-#[cfg_attr(feature = "serde1", derive(Serialize, Deserialize))]
 pub struct Seed([u8; 32]);
 
 impl AsRef<[u8; 32]> for Seed {
@@ -81,59 +77,33 @@ impl Debug for Seed {
     }
 }
 
-/// A wrapper for set_word_pos() input.
-///
-/// Can be constructed from any of the following:
-/// * `[u8; 5]`
+/// A wrapper around 64 bits of data that can be constructed from any of the
+/// following:
 /// * `u64`
-pub struct WordPosInput {
-    block_pos: u32,
-    index: usize,
-}
-
-impl From<[u8; 5]> for WordPosInput {
-    fn from(value: [u8; 5]) -> Self {
-        Self {
-            block_pos: u32::from_le_bytes(value[0..4].try_into().unwrap()),
-            index: (value[4] & 0b1111) as usize,
-        }
-    }
-}
-
-impl From<u64> for WordPosInput {
-    fn from(value: u64) -> Self {
-        Self {
-            block_pos: u32::from_le_bytes((value >> 4).to_le_bytes()[0..4].try_into().unwrap()),
-            index: (value.to_le_bytes()[0] & 0b1111) as usize,
-        }
-    }
-}
-
-/// A wrapper for `stream_id`.
+/// * `[u32; 2]`
+/// * `[u8; 8]`
 ///
-/// Can be constructed from any of the following:
-/// * `[u32; 3]`
-/// * `[u8; 12]`
-/// * `u128`
-pub struct StreamId([u32; Self::LEN]);
+/// The arrays should be in little endian order. You should not need to use
+/// this directly, as the methods in this crate that use this type call
+/// `.into()` for you, so you only need to supply any of the above types.
+pub struct U32x2([u32; Self::LEN]);
 
-impl StreamId {
-    /// Amount of raw bytes backing a `StreamId` instance.
+impl U32x2 {
+    /// Amount of raw bytes backing a `U32x2` instance.
     const BYTES: usize = size_of::<Self>();
 
-    /// The length of the array contained within `StreamId`.
-    const LEN: usize = 3;
+    /// The length of the array contained within `U32x2`.
+    const LEN: usize = 2;
 }
 
-impl From<[u32; Self::LEN]> for StreamId {
+impl From<[u32; Self::LEN]> for U32x2 {
     #[inline]
     fn from(value: [u32; Self::LEN]) -> Self {
-        let result = value.map(|v| v.to_le());
-        Self(result)
+        Self(value)
     }
 }
 
-impl From<[u8; Self::BYTES]> for StreamId {
+impl From<[u8; Self::BYTES]> for U32x2 {
     #[inline]
     fn from(value: [u8; Self::BYTES]) -> Self {
         let mut result = Self(Default::default());
@@ -142,69 +112,39 @@ impl From<[u8; Self::BYTES]> for StreamId {
             .iter_mut()
             .zip(value.chunks_exact(size_of::<u32>()))
         {
-            *cur = u32::from_le_bytes(chunk.try_into().unwrap()).to_le();
+            *cur = u32::from_le_bytes(chunk.try_into().unwrap());
         }
         result
     }
 }
 
-impl From<u128> for StreamId {
+impl From<u64> for U32x2 {
     #[inline]
-    fn from(value: u128) -> Self {
+    fn from(value: u64) -> Self {
         let result: [u8; Self::BYTES] = value.to_le_bytes()[..Self::BYTES].try_into().unwrap();
         result.into()
     }
 }
 
+/// A wrapper for `stream_id`.
+///
+/// Can be constructed from any of the following:
+/// * `u64`
+/// * `[u32; 2]`
+/// * `[u8; 8]`
+///
+/// The arrays should be in little endian order.
+pub type StreamId = U32x2;
+
 /// A wrapper for `block_pos`.
 ///
 /// Can be constructed from any of the following:
-/// * `[u8; 4]`
-/// * `u32`
-pub struct BlockPos(u32);
-
-impl From<u32> for BlockPos {
-    #[inline]
-    fn from(value: u32) -> Self {
-        Self(value.to_le())
-    }
-}
-
-impl From<[u8; 4]> for BlockPos {
-    #[inline]
-    fn from(value: [u8; 4]) -> Self {
-        Self(u32::from_le_bytes(value).to_le())
-    }
-}
-
-/// The results buffer that zeroizes on drop when the `zeroize` feature is enabled.
-#[derive(Clone)]
-pub struct BlockRngResults([u32; BUFFER_SIZE]);
-
-impl AsRef<[u32]> for BlockRngResults {
-    fn as_ref(&self) -> &[u32] {
-        &self.0
-    }
-}
-
-impl AsMut<[u32]> for BlockRngResults {
-    fn as_mut(&mut self) -> &mut [u32] {
-        &mut self.0
-    }
-}
-
-impl Default for BlockRngResults {
-    fn default() -> Self {
-        Self([0u32; BUFFER_SIZE])
-    }
-}
-
-#[cfg(feature = "zeroize")]
-impl Drop for BlockRngResults {
-    fn drop(&mut self) {
-        self.0.zeroize();
-    }
-}
+/// * `u64`
+/// * `[u32; 2]`
+/// * `[u8; 8]`
+///
+/// The arrays should be in little endian order.
+pub type BlockPos = U32x2;
 
 const BUFFER_SIZE: usize = 64;
 
@@ -214,7 +154,6 @@ const BUF_BLOCKS: u8 = BUFFER_SIZE as u8 >> 4;
 impl<R: Rounds, V: Variant> ChaChaCore<R, V> {
     /// Generates 4 blocks in parallel with avx2 & neon, but merely fills
     /// 4 blocks with sse2 & soft
-    #[cfg(feature = "rand_core")]
     fn generate(&mut self, buffer: &mut [u32; 64]) {
         cfg_if! {
             if #[cfg(chacha20_force_soft)] {
@@ -256,7 +195,7 @@ impl<R: Rounds, V: Variant> ChaChaCore<R, V> {
 }
 
 macro_rules! impl_chacha_rng {
-    ($ChaChaXRng:ident, $ChaChaXCore:ident, $rounds:ident, $abst: ident) => {
+    ($ChaChaXRng:ident, $ChaChaXCore:ident, $rounds:ident, $abst:ident) => {
         /// A cryptographically secure random number generator that uses the ChaCha algorithm.
         ///
         /// ChaCha is a stream cipher designed by Daniel J. Bernstein[^1], that we use as an RNG. It is
@@ -272,10 +211,10 @@ macro_rules! impl_chacha_rng {
         /// rounds is the minimum potentially secure configuration, and 20 rounds is widely used as a
         /// conservative choice.
         ///
-        /// We use a 32-bit counter and 96-bit stream identifier as in the IETF implementation[^3]
-        /// except that we use a stream identifier in place of a nonce. A 32-bit counter over 64-byte
-        /// (16 word) blocks allows 256 GiB of output before cycling, and the stream identifier allows
-        /// 2<sup>96</sup> unique streams of output per seed. Both counter and stream are initialized
+        /// We use a 64-bit counter and 64-bit stream identifier as in Bernstein's implementation
+        /// except that we use a stream identifier in place of a nonce. A 64-bit counter over 64-byte
+        /// (16 word) blocks allows 1 ZiB of output before cycling, and the stream identifier allows
+        /// 2<sup>64</sup> unique streams of output per seed. Both counter and stream are initialized
         /// to zero but may be set via the `set_word_pos` and `set_stream` methods.
         ///
         /// The word layout is:
@@ -284,7 +223,7 @@ macro_rules! impl_chacha_rng {
         /// constant  constant  constant  constant
         /// seed      seed      seed      seed
         /// seed      seed      seed      seed
-        /// counter   stream_id stream_id stream_id
+        /// counter   counter   stream_id stream_id
         /// ```
         /// This implementation uses an output buffer of sixteen `u32` words, and uses
         /// [`BlockRng`] to implement the [`RngCore`] methods.
@@ -303,16 +242,12 @@ macro_rules! impl_chacha_rng {
         /// let mut rng = ChaCha20Rng::from_seed(seed);
         /// rng.set_stream(100);
         ///
-        /// // you can also use a [u8; 12] in `.set_stream()`
-        /// rng.set_stream([3u8; 12]);
-        /// // or a [u32; 3]
-        /// rng.set_stream([4u32; 3]);
-        ///
+        /// // you can also use a [u8; 8] in `.set_stream()`
+        /// rng.set_stream([3u8; 8]);
+        /// // or a [u32; 2]
+        /// rng.set_stream([4u32; 2]);
         ///
         /// rng.set_word_pos(5);
-        ///
-        /// // you can also use a [u8; 5] in `.set_word_pos()`
-        /// rng.set_word_pos([2u8; 5]);
         ///
         /// let x = rng.next_u32();
         /// let mut array = [0u8; 32];
@@ -327,24 +262,25 @@ macro_rules! impl_chacha_rng {
         ///
         /// The other Rngs from this crate are initialized similarly.
         ///
-        /// [^1]: D. J. Bernstein, [*ChaCha, a variant of Salsa20*](
-        ///       https://cr.yp.to/chacha.html)
+        /// [^1]: D. J. Bernstein, [*ChaCha, a variant of Salsa20*](https://cr.yp.to/chacha.html)
         ///
-        /// [^2]: [eSTREAM: the ECRYPT Stream Cipher Project](
-        ///       http://www.ecrypt.eu.org/stream/)
-        ///
-        /// [^3]: Internet Research Task Force, [*ChaCha20 and Poly1305 for IETF Protocols*](
-        ///       https://www.rfc-editor.org/rfc/rfc8439)
-        #[derive(Clone)]
+        /// [^2]: [eSTREAM: the ECRYPT Stream Cipher Project](http://www.ecrypt.eu.org/stream/)
         pub struct $ChaChaXRng {
             /// The ChaChaCore struct
             pub core: BlockRng<$ChaChaXCore>,
         }
 
         /// The ChaCha core random number generator
-        #[derive(Clone)]
-        pub struct $ChaChaXCore(ChaChaCore<$rounds, Ietf>);
+        pub struct $ChaChaXCore(ChaChaCore<$rounds, Legacy>);
 
+        impl SeedableRng for $ChaChaXCore {
+            type Seed = Seed;
+
+            #[inline]
+            fn from_seed(seed: Self::Seed) -> Self {
+                Self(ChaChaCore::<$rounds, Legacy>::new(seed.as_ref(), &[0u8; 8]))
+            }
+        }
         impl SeedableRng for $ChaChaXRng {
             type Seed = [u8; 32];
 
@@ -355,22 +291,21 @@ macro_rules! impl_chacha_rng {
                 }
             }
         }
-
-        impl BlockRngCore for $ChaChaXCore {
-            type Item = u32;
-            type Results = BlockRngResults;
-
+        impl RngCore for $ChaChaXRng {
             #[inline]
-            fn generate(&mut self, r: &mut Self::Results) {
-                self.0.generate(&mut r.0);
-                #[cfg(target_endian = "big")]
-                for word in r.0.iter_mut() {
-                    *word = word.to_le();
-                }
+            fn next_u32(&mut self) -> u32 {
+                self.core.next_word()
+            }
+            #[inline]
+            fn next_u64(&mut self) -> u64 {
+                self.core.next_u64_from_u32()
+            }
+            #[inline]
+            fn fill_bytes(&mut self, dest: &mut [u8]) {
+                self.core.fill_bytes(dest)
             }
         }
-
-        impl CryptoBlockRng for $ChaChaXCore {}
+        impl CryptoGenerator for $ChaChaXCore {}
         impl CryptoRng for $ChaChaXRng {}
 
         #[cfg(feature = "zeroize")]
@@ -386,30 +321,6 @@ macro_rules! impl_chacha_rng {
             }
         }
 
-        impl SeedableRng for $ChaChaXCore {
-            type Seed = Seed;
-
-            #[inline]
-            fn from_seed(seed: Self::Seed) -> Self {
-                Self(ChaChaCore::<$rounds, Ietf>::new(seed.as_ref(), &[0u8; 12]))
-            }
-        }
-
-        impl RngCore for $ChaChaXRng {
-            #[inline]
-            fn next_u32(&mut self) -> u32 {
-                self.core.next_u32()
-            }
-            #[inline]
-            fn next_u64(&mut self) -> u64 {
-                self.core.next_u64()
-            }
-            #[inline]
-            fn fill_bytes(&mut self, dest: &mut [u8]) {
-                self.core.fill_bytes(dest)
-            }
-        }
-
         impl $ChaChaXRng {
             // The buffer is a 4-block window, i.e. it is always at a block-aligned position in the
             // stream but if the stream has been sought it may not be self-aligned.
@@ -417,35 +328,33 @@ macro_rules! impl_chacha_rng {
             /// Get the offset from the start of the stream, in 32-bit words.
             ///
             /// Since the generated blocks are 64 words (2<sup>6</sup>) long and the
-            /// counter is 32-bits, the offset is a 36-bit number. Sub-word offsets are
+            /// counter is 64-bits, the offset is a 68-bit number. Sub-word offsets are
             /// not supported, hence the result can simply be multiplied by 4 to get a
             /// byte-offset.
             #[inline]
-            pub fn get_word_pos(&self) -> u64 {
-                let mut result =
-                    u64::from(self.core.core.0.state[12].wrapping_sub(BUF_BLOCKS.into())) << 4;
-                result += self.core.index() as u64;
-                // eliminate bits above the 36th bit
-                result & 0xfffffffff
+            pub fn get_word_pos(&self) -> u128 {
+                let mut block_counter = (u64::from(self.core.core.0.state[13]) << 32)
+                    | u64::from(self.core.core.0.state[12]);
+                block_counter = block_counter.wrapping_sub(BUF_BLOCKS as u64);
+                let word_pos =
+                    block_counter as u128 * BLOCK_WORDS as u128 + self.core.index() as u128;
+                // eliminate bits above the 68th bit
+                word_pos & ((1 << 68) - 1)
             }
 
-            /// Set the offset from the start of the stream, in 32-bit words. This method
-            /// takes any of the following:
-            /// * `[u8; 5]`
-            /// * `u64`
+            /// Set the offset from the start of the stream, in 32-bit words.
             ///
-            /// As with `get_word_pos`, we use a 36-bit number. When given a `u64`, we use
-            /// the least significant 4 bits as the RNG's index, and the 32 bits before it
-            /// as the block position.
-            ///
-            /// When given a `[u8; 5]`, the word_pos is set similarly, but it is more
-            /// arbitrary.
+            /// As with `get_word_pos`, we use a 68-bit number. Since the generator
+            /// simply cycles at the end of its period (1 ZiB), we ignore the upper
+            /// 60 bits.
             #[inline]
-            pub fn set_word_pos<W: Into<WordPosInput>>(&mut self, word_offset: W) {
-                let word_pos: WordPosInput = word_offset.into();
-                self.core.core.0.state[12] = word_pos.block_pos;
-                // generate will increase block_pos by 4
-                self.core.generate_and_set(word_pos.index);
+            pub fn set_word_pos(&mut self, word_offset: u128) {
+                let index = (word_offset & 0b1111) as usize;
+                let counter = word_offset >> 4;
+                //self.set_block_pos(counter as u64);
+                self.core.core.0.state[12] = counter as u32;
+                self.core.core.0.state[13] = (counter >> 32) as u32;
+                self.core.generate_and_set(index);
             }
 
             /// Set the block pos and reset the RNG's index.
@@ -453,38 +362,60 @@ macro_rules! impl_chacha_rng {
             /// The word pos will be equal to `block_pos * 16 words per block`.
             ///
             /// This method takes any of the following:
-            /// * `[u8; 4]`
-            /// * `u32`
+            /// * `u64`
+            /// * `[u32; 2]`
+            /// * `[u8; 8]`
+            ///
+            /// Note: the arrays should be in little endian order.
             #[inline]
+            #[allow(unused)]
             pub fn set_block_pos<B: Into<BlockPos>>(&mut self, block_pos: B) {
                 self.core.reset();
-                self.core.core.0.state[12] = block_pos.into().0.to_le()
+                let block_pos = block_pos.into().0;
+                self.core.core.0.state[12] = block_pos[0];
+                self.core.core.0.state[13] = block_pos[1]
             }
 
             /// Get the block pos.
             #[inline]
-            pub fn get_block_pos(&self) -> u32 {
-                self.core.core.0.state[12]
+            #[allow(unused)]
+            pub fn get_block_pos(&self) -> u64 {
+                self.core.core.0.state[12] as u64 | ((self.core.core.0.state[13] as u64) << 32)
             }
 
-            /// Set the stream number. The lower 96 bits are used and the rest are
+            /// Set the stream number. The lower 64 bits are used and the rest are
             /// discarded. This method takes any of the following:
-            /// * `[u32; 3]`
-            /// * `[u8; 12]`
-            /// * `u128`
+            /// * `u64`
+            /// * `[u32; 2]`
+            /// * `[u8; 8]`
             ///
-            /// This is initialized to zero; 2<sup>96</sup> unique streams of output
-            /// are available per seed/key.
+            /// Note: the arrays should be in little endian order.
+            ///
+            /// This is initialized to zero; 2<sup>64</sup> unique streams of output
+            /// are available per seed/key. In theory a 96-bit nonce can be used by
+            /// passing the last 64-bits to this function and using the first 32-bits as
+            /// the most significant half of the 64-bit counter, which may be set
+            /// directly via `set_block_pos` like so:
+            ///
+            /// ```
+            /// use chacha20::ChaCha20Rng;
+            /// use rand_core::{SeedableRng, RngCore};
+            ///
+            /// let seed = [2u8; 32];
+            /// let mut rng = ChaCha20Rng::from_seed(seed);
+            ///
+            /// // set state[12] to 0, state[13] to 1, state[14] to 2, state[15] to 3
+            /// rng.set_block_pos([0u32, 1u32]);
+            /// rng.set_stream([2u32, 3u32]);
+            ///
+            /// // confirm that state is set correctly
+            /// assert_eq!(rng.get_block_pos(), 1 << 32);
+            /// assert_eq!(rng.get_stream(), (3 << 32) + 2);
+            /// ```
             #[inline]
             pub fn set_stream<S: Into<StreamId>>(&mut self, stream: S) {
                 let stream: StreamId = stream.into();
-                for (n, val) in self.core.core.0.state[Ietf::NONCE_INDEX..BLOCK_WORDS as usize]
-                    .as_mut()
-                    .iter_mut()
-                    .zip(stream.0.iter())
-                {
-                    *n = val.to_le();
-                }
+                self.core.core.0.state[14..].copy_from_slice(&stream.0);
                 if self.core.index() != BUFFER_SIZE {
                     self.core.generate_and_set(self.core.index());
                 }
@@ -492,9 +423,9 @@ macro_rules! impl_chacha_rng {
 
             /// Get the stream number.
             #[inline]
-            pub fn get_stream(&self) -> u128 {
-                let mut result = [0u8; 16];
-                for (i, &big) in self.core.core.0.state[Ietf::NONCE_INDEX..BLOCK_WORDS as usize]
+            pub fn get_stream(&self) -> u64 {
+                let mut result = [0u8; 8];
+                for (i, &big) in self.core.core.0.state[14..BLOCK_WORDS as usize]
                     .iter()
                     .enumerate()
                 {
@@ -504,7 +435,7 @@ macro_rules! impl_chacha_rng {
                     result[index + 2] = (big >> 16) as u8;
                     result[index + 3] = (big >> 24) as u8;
                 }
-                u128::from_le_bytes(result)
+                u64::from_le_bytes(result)
             }
 
             /// Get the seed.
@@ -532,25 +463,6 @@ macro_rules! impl_chacha_rng {
 
         impl Eq for $ChaChaXRng {}
 
-        #[cfg(feature = "serde1")]
-        impl Serialize for $ChaChaXRng {
-            fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
-            where
-                S: Serializer,
-            {
-                $abst::$ChaChaXRng::from(self).serialize(s)
-            }
-        }
-        #[cfg(feature = "serde1")]
-        impl<'de> Deserialize<'de> for $ChaChaXRng {
-            fn deserialize<D>(d: D) -> Result<Self, D::Error>
-            where
-                D: Deserializer<'de>,
-            {
-                $abst::$ChaChaXRng::deserialize(d).map(|x| Self::from(&x))
-            }
-        }
-
         impl From<$ChaChaXCore> for $ChaChaXRng {
             fn from(core: $ChaChaXCore) -> Self {
                 $ChaChaXRng {
@@ -560,18 +472,14 @@ macro_rules! impl_chacha_rng {
         }
 
         mod $abst {
-            #[cfg(feature = "serde1")]
-            use serde::{Deserialize, Serialize};
-
             // The abstract state of a ChaCha stream, independent of implementation choices. The
             // comparison and serialization of this object is considered a semver-covered part of
             // the API.
             #[derive(Debug, PartialEq, Eq)]
-            #[cfg_attr(feature = "serde1", derive(Serialize, Deserialize))]
             pub(crate) struct $ChaChaXRng {
                 seed: crate::rng::Seed,
-                stream: u128,
-                word_pos: u64,
+                stream: u64,
+                word_pos: u128,
             }
 
             impl From<&super::$ChaChaXRng> for $ChaChaXRng {
@@ -597,6 +505,20 @@ macro_rules! impl_chacha_rng {
                 }
             }
         }
+
+        impl Generator for $ChaChaXCore {
+            type Output = [u32; BUFFER_SIZE];
+
+            #[inline]
+            fn generate(&mut self, r: &mut Self::Output) {
+                self.0.generate(r);
+            }
+
+            #[cfg(feature = "zeroize")]
+            fn drop(&mut self, output: &mut Self::Output) {
+                output.zeroize();
+            }
+        }
     };
 }
 
@@ -608,6 +530,8 @@ impl_chacha_rng!(ChaCha20Rng, ChaCha20Core, R20, abst20);
 
 #[cfg(test)]
 pub(crate) mod tests {
+
+    use hex_literal::hex;
 
     use super::*;
 
@@ -639,13 +563,14 @@ pub(crate) mod tests {
         let mut rng = ChaCha20Rng::from_seed(KEY);
         rng.set_stream(1337);
         // test counter wrapping-add
-        rng.set_word_pos((2u64).pow(36) - 1);
-        let mut output = [3u8; 128];
+        rng.set_word_pos((1 << 68) - 65);
+        let mut output = [3u8; 1280];
         rng.fill_bytes(&mut output);
 
-        assert_ne!(output, [0u8; 128]);
+        assert_ne!(output, [0u8; 1280]);
 
-        assert!(rng.get_word_pos() < 2000 && rng.get_word_pos() != 0);
+        assert!(rng.get_word_pos() < 2000);
+        assert!(rng.get_word_pos() != 0);
     }
 
     #[test]
@@ -653,12 +578,12 @@ pub(crate) mod tests {
         let seed = [44u8; 32];
         let mut rng = ChaCha20Rng::from_seed(seed);
 
-        // test set_stream with [u32; 3]
-        rng.set_stream([313453u32, 0u32, 0u32]);
+        // test set_stream with [u32; 2]
+        rng.set_stream([313453u32, 0u32]);
         assert_eq!(rng.get_stream(), 313453);
 
         // test set_stream with [u8; 12]
-        rng.set_stream([89, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
+        rng.set_stream([89, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(rng.get_stream(), 89);
 
         // test set_stream with u128
@@ -671,69 +596,16 @@ pub(crate) mod tests {
         // test word_pos = 16 * block_pos
         assert_eq!(rng.get_word_pos(), 58392 * 16);
 
-        // test set_block_pos with [u8; 4]
-        rng.set_block_pos([77, 0, 0, 0]);
+        // test set_block_pos with [u8; 8]
+        rng.set_block_pos([77, 0, 0, 0, 0, 0, 0, 0]);
         assert_eq!(rng.get_block_pos(), 77);
 
         // test set_word_pos with u64
         rng.set_word_pos(8888);
         assert_eq!(rng.get_word_pos(), 8888);
-
-        // test set_word_pos with [u8; 5]
-        rng.set_word_pos([55, 0, 0, 0, 0])
     }
-
-    #[cfg(feature = "serde1")]
-    use super::{ChaCha8Rng, ChaCha12Rng, ChaCha20Rng};
 
     type ChaChaRng = ChaCha20Rng;
-
-    #[cfg(feature = "serde1")]
-    #[test]
-    fn test_chacha_serde_roundtrip() {
-        let seed = [
-            1, 0, 52, 0, 0, 0, 0, 0, 1, 0, 10, 0, 22, 32, 0, 0, 2, 0, 55, 49, 0, 11, 0, 0, 3, 0, 0,
-            0, 0, 0, 2, 92,
-        ];
-        let mut rng1 = ChaCha20Rng::from_seed(seed);
-        let mut rng2 = ChaCha12Rng::from_seed(seed);
-        let mut rng3 = ChaCha8Rng::from_seed(seed);
-
-        let encoded1 = serde_json::to_string(&rng1).unwrap();
-        let encoded2 = serde_json::to_string(&rng2).unwrap();
-        let encoded3 = serde_json::to_string(&rng3).unwrap();
-
-        let mut decoded1: ChaCha20Rng = serde_json::from_str(&encoded1).unwrap();
-        let mut decoded2: ChaCha12Rng = serde_json::from_str(&encoded2).unwrap();
-        let mut decoded3: ChaCha8Rng = serde_json::from_str(&encoded3).unwrap();
-
-        assert_eq!(rng1, decoded1);
-        assert_eq!(rng2, decoded2);
-        assert_eq!(rng3, decoded3);
-
-        assert_eq!(rng1.next_u32(), decoded1.next_u32());
-        assert_eq!(rng2.next_u32(), decoded2.next_u32());
-        assert_eq!(rng3.next_u32(), decoded3.next_u32());
-    }
-
-    // This test validates that:
-    // 1. a hard-coded serialization demonstrating the format at time of initial release can still
-    //    be deserialized to a ChaChaRng
-    // 2. re-serializing the resultant object produces exactly the original string
-    //
-    // Condition 2 is stronger than necessary: an equivalent serialization (e.g. with field order
-    // permuted, or whitespace differences) would also be admissible, but would fail this test.
-    // However testing for equivalence of serialized data is difficult, and there shouldn't be any
-    // reason we need to violate the stronger-than-needed condition, e.g. by changing the field
-    // definition order.
-    #[cfg(feature = "serde1")]
-    #[test]
-    fn test_chacha_serde_format_stability() {
-        let j = r#"{"seed":[4,8,15,16,23,42,4,8,15,16,23,42,4,8,15,16,23,42,4,8,15,16,23,42,4,8,15,16,23,42,4,8],"stream":27182818284,"word_pos":3141592653}"#;
-        let r: ChaChaRng = serde_json::from_str(j).unwrap();
-        let j1 = serde_json::to_string(&r).unwrap();
-        assert_eq!(j, j1);
-    }
 
     #[test]
     fn test_chacha_construction() {
@@ -743,6 +615,8 @@ pub(crate) mod tests {
         ];
         let mut rng1 = ChaChaRng::from_seed(seed);
         assert_eq!(rng1.next_u32(), 137206642);
+
+        assert_eq!(rng1.get_seed(), seed);
 
         let mut rng2 = ChaChaRng::from_rng(&mut rng1);
         assert_eq!(rng2.next_u32(), 1325750369);
@@ -850,9 +724,9 @@ pub(crate) mod tests {
         assert_eq!(results, expected);
         assert_eq!(rng3.get_word_pos(), expected_end);
 
-        // Test block 2 by using `set_block_pos` and [u8; 4]
+        // Test block 2 by using `set_block_pos` and [u8; 8]
         let mut rng4 = ChaChaRng::from_seed(seed);
-        rng4.set_block_pos([2, 0, 0, 0]);
+        rng4.set_block_pos([2, 0, 0, 0, 0, 0, 0, 0]);
         results = [0u32; 16];
         for i in results.iter_mut() {
             *i = rng4.next_u32();
@@ -921,8 +795,9 @@ pub(crate) mod tests {
         let seed = hex!("000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f");
         let mut rng = ChaChaRng::from_seed(seed);
 
-        let stream_id = hex!("000000090000004a00000000");
+        let stream_id = hex!("0000004a00000000");
         rng.set_stream(stream_id);
+        rng.set_block_pos(hex!("0000000000000009"));
 
         // The test vectors omit the first 64-bytes of the keystream
         let mut discard_first_64 = [0u8; 64];
@@ -942,31 +817,54 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn test_chacha_nonce_2() {
+        // Test vector 5 from
+        // https://tools.ietf.org/html/draft-nir-cfrg-chacha20-poly1305-04
+        // Although we do not support setting a nonce, we try it here anyway so
+        // we can use this test vector.
+        let seed = [0u8; 32];
+        let mut rng = ChaChaRng::from_seed(seed);
+        // 96-bit nonce in LE order is: 0,0,0,0, 0,0,0,0, 0,0,0,2
+        rng.set_stream(2u64 << (24 + 32));
+
+        let mut results = [0u32; 16];
+        for i in results.iter_mut() {
+            *i = rng.next_u32();
+        }
+        let expected = [
+            0x374dc6c2, 0x3736d58c, 0xb904e24a, 0xcd3f93ef, 0x88228b1a, 0x96a4dfb3, 0x5b76ab72,
+            0xc727ee54, 0x0e0e978a, 0xf3145c95, 0x1b748ea8, 0xf786c297, 0x99c28f5f, 0x628314e8,
+            0x398a19fa, 0x6ded1b53,
+        ];
+        assert_eq!(results, expected);
+    }
+
+    #[test]
     fn test_chacha_clone_streams() {
         let seed = [
             0, 0, 0, 0, 1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0, 4, 0, 0, 0, 5, 0, 0, 0, 6, 0, 0, 0, 7,
             0, 0, 0,
         ];
-        let mut rng = ChaChaRng::from_seed(seed);
-        let mut clone = rng.clone();
+        let mut rng1 = ChaChaRng::from_seed(seed);
+        let mut rng2 = ChaChaRng::from_seed(seed);
         for _ in 0..16 {
-            assert_eq!(rng.next_u64(), clone.next_u64());
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
         }
 
-        rng.set_stream(51);
-        assert_eq!(rng.get_stream(), 51);
-        assert_eq!(clone.get_stream(), 0);
+        rng1.set_stream(51);
+        assert_eq!(rng1.get_stream(), 51);
+        assert_eq!(rng2.get_stream(), 0);
         let mut fill_1 = [0u8; 7];
-        rng.fill_bytes(&mut fill_1);
+        rng1.fill_bytes(&mut fill_1);
         let mut fill_2 = [0u8; 7];
-        clone.fill_bytes(&mut fill_2);
+        rng2.fill_bytes(&mut fill_2);
         assert_ne!(fill_1, fill_2);
         for _ in 0..7 {
-            assert!(rng.next_u64() != clone.next_u64());
+            assert!(rng1.next_u64() != rng2.next_u64());
         }
-        clone.set_stream(51); // switch part way through block
+        rng2.set_stream(51); // switch part way through block
         for _ in 7..16 {
-            assert_eq!(rng.next_u64(), clone.next_u64());
+            assert_eq!(rng1.next_u64(), rng2.next_u64());
         }
     }
 
@@ -975,7 +873,7 @@ pub(crate) mod tests {
         use super::{BLOCK_WORDS, BUF_BLOCKS};
         let mut rng = ChaChaRng::from_seed(Default::default());
         // refilling the buffer in set_word_pos will wrap the block counter to 0
-        let last_block = (2u64).pow(36) - u64::from(BUF_BLOCKS * BLOCK_WORDS);
+        let last_block = (1 << 68) - u128::from(BUF_BLOCKS * BLOCK_WORDS);
         rng.set_word_pos(last_block);
         assert_eq!(rng.get_word_pos(), last_block);
     }
@@ -985,7 +883,7 @@ pub(crate) mod tests {
         use super::BLOCK_WORDS;
         let mut rng = ChaChaRng::from_seed(Default::default());
         // refilling the buffer in set_word_pos will wrap the block counter past 0
-        let last_block = (1 << 36) - u64::from(BLOCK_WORDS);
+        let last_block = (1 << 68) - u128::from(BLOCK_WORDS);
         rng.set_word_pos(last_block);
         assert_eq!(rng.get_word_pos(), last_block);
     }
@@ -1056,7 +954,7 @@ pub(crate) mod tests {
                                 "Failed test at start_word_pos = {},\nfailed index: {:?}\nFailing word_pos = {}",
                                 debug_start_word_pos,
                                 index,
-                                debug_start_word_pos + (index / 4) as u64
+                                debug_start_word_pos + (index / 4) as u128
                             );
                         }
                     }
@@ -1069,7 +967,7 @@ pub(crate) mod tests {
             tester_array = [0u8; LEN];
             dest_pos = 0;
 
-            // test fill_bytes with lengths starting at N bytes, decreasing by 1,
+            // test fill_bytes with lengths starting at `N` bytes, decreasing by 1,
             // down to 1 byte
             for test_len in 1..=N {
                 let debug_start_word_pos = rng.get_word_pos();
@@ -1090,7 +988,7 @@ pub(crate) mod tests {
                                 "Failed test at start_word_pos = {},\nfailed index: {:?}\nFailing word_pos = {}",
                                 debug_start_word_pos,
                                 index,
-                                debug_start_word_pos + (index / 4) as u64
+                                debug_start_word_pos + (index / 4) as u128
                             );
                         }
                     }
@@ -1106,8 +1004,9 @@ pub(crate) mod tests {
     fn test_trait_objects() {
         use rand_core::CryptoRng;
 
-        let mut rng1 = ChaChaRng::from_seed(Default::default());
-        let rng2 = &mut rng1.clone() as &mut dyn CryptoRng;
+        let seed = Default::default();
+        let mut rng1 = ChaChaRng::from_seed(seed);
+        let rng2 = &mut ChaChaRng::from_seed(seed) as &mut dyn CryptoRng;
         for _ in 0..1000 {
             assert_eq!(rng1.next_u64(), rng2.next_u64());
         }
@@ -1116,33 +1015,149 @@ pub(crate) mod tests {
     #[test]
     fn stream_id_endianness() {
         let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
-        rng.set_stream([3, 3333, 333333]);
-        let expected = 2059058063;
+        rng.set_stream([3, 3333]);
+        let expected = 1152671828;
         assert_eq!(rng.next_u32(), expected);
         rng.set_stream(1234567);
-        let expected = 1254506509;
+        let expected = 3110319182;
         assert_eq!(rng.next_u32(), expected);
-        rng.set_stream([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
-        let expected = 1391671567;
+        rng.set_stream([1, 2, 3, 4, 5, 6, 7, 8]);
+        let expected = 3790367479;
         assert_eq!(rng.next_u32(), expected);
     }
 
-    /// If this test fails, the backend may be
+    /// If this test fails, the backend may not be
     /// performing 64-bit addition.
     #[test]
-    fn counter_wrapping() {
+    fn counter_wrapping_64_bit_counter() {
         let mut rng = ChaChaRng::from_seed([0u8; 32]);
 
         // get first four blocks and word pos
         let mut first_blocks = [0u8; 64 * 4];
         rng.fill_bytes(&mut first_blocks);
-        let word_pos = rng.get_word_pos();
+        let first_blocks_end_word_pos = rng.get_word_pos();
+        let first_blocks_end_block_counter = rng.get_block_pos();
 
         // get first four blocks after wrapping
-        rng.set_block_pos(u32::MAX);
+        rng.set_block_pos([u32::MAX, u32::MAX]);
         let mut result = [0u8; 64 * 5];
         rng.fill_bytes(&mut result);
-        assert_eq!(word_pos, rng.get_word_pos());
+        assert_eq!(first_blocks_end_word_pos, rng.get_word_pos());
+        assert_eq!(first_blocks_end_block_counter, rng.get_block_pos() - 3);
+
+        if first_blocks[0..64 * 4].ne(&result[64..]) {
+            for (i, (a, b)) in first_blocks.iter().zip(result.iter().skip(64)).enumerate() {
+                if a.ne(b) {
+                    panic!("i = {}\na = {}\nb = {}", i, a, b);
+                }
+            }
+        }
         assert_eq!(&first_blocks[0..64 * 4], &result[64..]);
+    }
+
+    /// If this test fails, the backend may be doing
+    /// 32-bit addition.
+    #[test]
+    fn counter_not_wrapping_at_32_bits() {
+        let mut rng = ChaChaRng::from_seed([0u8; 32]);
+
+        // get first four blocks and word pos
+        let mut first_blocks = [0u8; 64 * 4];
+        rng.fill_bytes(&mut first_blocks);
+        let first_blocks_end_word_pos = rng.get_word_pos();
+
+        // get first four blocks after the supposed overflow
+        rng.set_block_pos(u32::MAX as u64);
+        let mut result = [0u8; 64 * 5];
+        rng.fill_bytes(&mut result);
+        assert_ne!(first_blocks_end_word_pos, rng.get_word_pos());
+        assert_eq!(
+            rng.get_word_pos(),
+            first_blocks_end_word_pos + (1 << 32) * BLOCK_WORDS as u128
+        );
+        assert_ne!(&first_blocks[0..64 * 4], &result[64..]);
+    }
+
+    /// Counts how many bytes were incorrect, and returns:
+    ///
+    /// (`index_of_first_incorrect_word`, `num_incorrect_bytes`)
+    fn count_incorrect_bytes(expected: &[u8], output: &[u8]) -> (Option<usize>, u32) {
+        assert_eq!(expected.len(), output.len());
+        let mut num_incorrect_bytes = 0;
+        let mut index_of_first_incorrect_word = None;
+        expected
+            .iter()
+            .enumerate()
+            .zip(output.iter())
+            .for_each(|((i, a), b)| {
+                if a.ne(b) {
+                    if index_of_first_incorrect_word.is_none() {
+                        index_of_first_incorrect_word = Some(i / 4)
+                    }
+                    num_incorrect_bytes += 1;
+                }
+            });
+        (index_of_first_incorrect_word, num_incorrect_bytes)
+    }
+
+    /// Test vector 8 from https://github.com/pyca/cryptography/blob/main/vectors/cryptography_vectors/ciphers/ChaCha20/counter-overflow.txt
+    #[test]
+    fn counter_overflow_and_diagnostics() {
+        let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
+        let block_pos = 4294967295;
+        assert_eq!(block_pos, u32::MAX as u64);
+        rng.set_block_pos(4294967295);
+
+        let mut output = [0u8; 64 * 4];
+        rng.fill_bytes(&mut output[..64 * 3]);
+        let block_before_overflow = hex!(
+            "ace4cd09e294d1912d4ad205d06f95d9c2f2bfcf453e8753f128765b62215f4d92c74f2f626c6a640c0b1284d839ec81f1696281dafc3e684593937023b58b1d"
+        );
+        let first_block_after_overflow = hex!(
+            "3db41d3aa0d329285de6f225e6e24bd59c9a17006943d5c9b680e3873bdc683a5819469899989690c281cd17c96159af0682b5b903468a61f50228cf09622b5a"
+        );
+        let second_block_after_overflow = hex!(
+            "46f0f6efee15c8f1b198cb49d92b990867905159440cc723916dc0012826981039ce1766aa2542b05db3bd809ab142489d5dbfe1273e7399637b4b3213768aaa"
+        );
+        assert!(
+            output[..64].eq(&block_before_overflow),
+            "The first parblock was incorrect before overflow, indicating that ChaCha was not implemented correctly for this backend. Check the rounds() fn or the functions that it calls"
+        );
+
+        rng.set_block_pos(u32::MAX as u64 - 1);
+        let mut skipped_blocks = [0u8; 64 * 3];
+        rng.fill_bytes(&mut skipped_blocks);
+        rng.fill_bytes(&mut output[64 * 3..]);
+
+        output.chunks_exact(64).enumerate().skip(1).zip(&[first_block_after_overflow, second_block_after_overflow, second_block_after_overflow]).for_each(|((i, a), b)| {
+            let (index_of_first_incorrect_word, num_incorrect_bytes) = count_incorrect_bytes(a, b);
+            let msg = if num_incorrect_bytes == 0 {
+                "The block was correct and this will not be shown"
+            } else if num_incorrect_bytes > 32 {
+                "Most of the block was incorrect, indicating an issue with the counter using 32-bit addition towards the beginning of fn rounds()"
+            } else if num_incorrect_bytes <= 8 && matches!(index_of_first_incorrect_word, Some(12 | 13)) {
+                "When the state was added to the results/res buffer at the end of fn rounds, the counter was probably incremented in 32-bit fashion for this parblock"
+            } else {
+                // this is probably unreachable in the event of a failed assertion, but it depends on the seed
+                "Some of the block was incorrect"
+            };
+            assert!(a.eq(b), "PARBLOCK #{} uses incorrect counter addition\nDiagnostic = {}\nnum_incorrect_bytes = {}\nindex_of_first_incorrect_word = {:?}", i + 1, msg, num_incorrect_bytes, index_of_first_incorrect_word);
+        });
+    }
+
+    /// Test vector 9 from https://github.com/pyca/cryptography/blob/main/vectors/cryptography_vectors/ciphers/ChaCha20/counter-overflow.txt
+    #[test]
+    fn counter_wrap_1() {
+        let mut rng = ChaCha20Rng::from_seed([0u8; 32]);
+        let block_pos = 18446744073709551615;
+        assert_eq!(block_pos, u64::MAX);
+        rng.set_block_pos(block_pos);
+
+        let mut output = [0u8; 64 * 3];
+        rng.fill_bytes(&mut output);
+        let expected = hex!(
+            "d7918cd8620cf832532652c04c01a553092cfb32e7b3f2f5467ae9674a2e9eec17368ec8027a357c0c51e6ea747121fec45284be0f099d2b3328845607b1768976b8e0ada0f13d90405d6ae55386bd28bdd219b8a08ded1aa836efcc8b770dc7da41597c5157488d7724e03fb8d84a376a43b8f41518a11cc387b669b2ee65869f07e7be5551387a98ba977c732d080dcb0f29a048e3656912c6533e32ee7aed29b721769ce64e43d57133b074d839d531ed1f28510afb45ace10a1f4b794d6f"
+        );
+        assert_eq!(expected, output);
     }
 }

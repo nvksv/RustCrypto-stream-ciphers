@@ -49,7 +49,7 @@
 //! [Rabbit]: https://tools.ietf.org/html/rfc4503#section-2.3
 
 #![no_std]
-#![cfg_attr(docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 #![doc(
     html_logo_url = "https://raw.githubusercontent.com/RustCrypto/media/8f1a9894/logo.svg",
     html_favicon_url = "https://raw.githubusercontent.com/RustCrypto/media/8f1a9894/logo.svg"
@@ -96,7 +96,6 @@ pub type RabbitKeyOnly = StreamCipherCoreWrapper<RabbitKeyOnlyCore>;
 pub type Rabbit = StreamCipherCoreWrapper<RabbitCore>;
 
 /// RFC 4503. 2.2.  Inner State (page 2).
-#[derive(Clone)]
 struct State {
     /// State variables
     x: [u32; 8],
@@ -262,7 +261,6 @@ impl core::ops::Drop for State {
 }
 
 /// Core state of the Rabbit stream cipher initialized only with key.
-#[derive(Clone)]
 pub struct RabbitKeyOnlyCore {
     state: State,
 }
@@ -301,7 +299,6 @@ impl StreamCipherCore for RabbitKeyOnlyCore {
 impl ZeroizeOnDrop for RabbitKeyOnlyCore {}
 
 /// Core state of the Rabbit stream cipher initialized with key and IV.
-#[derive(Clone)]
 pub struct RabbitCore {
     state: State,
 }
